@@ -1,5 +1,6 @@
 import streamlit as st
 from supabase import create_client, Client
+from supabase.lib.client_options import ClientOptions
 from dotenv import load_dotenv
 import os
 import math
@@ -20,8 +21,11 @@ def sign_up(email, password):
 
 def sign_in(email, password):
     try:
-        user = supabase.auth.sign_in_with_password({"email": email, "password": password}) 
-        return user
+        res = supabase.auth.sign_in_with_password({"email": email, "password": password}) 
+        if res.session:
+            st.session_state.access_token = res.session.access_token
+            st.session_state.user_email = res.user.email
+        return res
     except Exception as e:
         st.error(f"Login failed: {e}")    
 
@@ -31,7 +35,34 @@ def sign_out():
         st.session_state.user_email = None
         st.rerun()
     except Exception as e:
-        st.error(f"Logout failed: {e}")   
+        st.error(f"Logout failed: {e}") 
+
+def get_authenticated_client():
+    token = st.session_state.get("access_token")
+    if token:
+        # Pass the access token so RLS recognizes the logged-in user
+        supabase.postgrest.auth(token)
+        return supabase
+        #return create_client(supabase_url, supabase_key, options=ClientOptions(headers={"Authorization": f"Bearer {token}"}))
+    return supabase
+
+
+def load_user_data(user_email):
+    # Fetch student data assigned to user
+    client = get_authenticated_client()
+    response = client.table("mile_records").select("*").eq("user_email", user_email).execute()
+    data = response.data
+
+    # Process DB rows back into nested dictionary structure
+    students = {}
+    for row in data:
+        name = row["student_name"]
+        if name not in students:
+            students[name] = {}
+        if row["run_number"] and row["mile_time"]:
+            students[name][row["run_number"]] = row["mile_time"]
+
+    return students
 
 def main_app(user_email):
     st.title("👟 P.E. Mile Tracking System")
@@ -118,18 +149,37 @@ def main_app(user_email):
             new_name = st.text_input("Student Name")
             if st.button("Add Student"):
                 if new_name and new_name not in st.session_state.students:
-                    st.session_state.students[new_name] = {}
-                    st.success(f"Added {new_name} to roster.")
-                    st.rerun()
+                    try:
+                        client = get_authenticated_client()
+                        client.table("mile_records").insert({
+                            "user_email": st.session_state.user_email,
+                            "student_name": new_name,
+                            "run_number": None,
+                            "mile_time": None
+                        }).execute()
+                        st.session_state.students[new_name] = {}
+                        st.success(f"Added {new_name} to roster.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Failed to add student {e}")
                 elif new_name in st.session_state.students:
                     st.warning("Student already exists.")
             if st.button("Remove Student"):
                 if len(st.session_state.students) == 1:
                     st.warning("Cannot remove student; a class needs at least one!")
                 elif new_name and new_name in st.session_state.students:
-                    del st.session_state.students[new_name]
-                    st.success(f"Removed {new_name} from roster.")
-                    st.rerun()
+                    try:
+                        client = get_authenticated_client()
+                        client.table("mile_records") \
+                            .delete() \
+                            .eq("user_email", st.session_state.user_email) \
+                            .eq("student_name", new_name) \
+                            .execute()
+                        del st.session_state.students[new_name]
+                        st.success(f"Removed {new_name} from roster.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Failed to remove student: {e}")
                 elif new_name not in st.session_state.students:
                     st.warning("Student is not on the roster.")
 
@@ -150,9 +200,27 @@ def main_app(user_email):
 
             if st.button("Save Mile Time"):
                 formatted_time = f"{mins}:{secs:02d}"
-                st.session_state.students[student_target][mile_number] = formatted_time
-                st.success(f"Saved Run #{mile_number} as {formatted_time} for {student_target}!")
-                st.rerun()
+
+                try:
+                    # 1. Use the authenticated client to bypass/satisfy RLS
+                    client = get_authenticated_client()
+                    client.table("mile_records").upsert({
+                        "user_email": user_email,
+                        "student_name": student_target,
+                        "run_number": mile_number,
+                        "mile_time": formatted_time
+                    }).execute()
+
+                    # 2. Update local state so UI updates immediately
+                    if student_target not in st.session_state.students:
+                        st.session_state.students[student_target] = {}
+                    st.session_state.students[student_target][mile_number] = formatted_time
+
+                    st.success(f"Saved Run #{mile_number} as {formatted_time} for {student_target}!")
+                    st.rerun()
+
+                except Exception as e:
+                    st.error(f"Failed to save mile time {e}")
 
 
     if st.button("Logout"):
