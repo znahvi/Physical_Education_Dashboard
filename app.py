@@ -209,7 +209,9 @@ def main_app(user_email):
                         "student_name": student_target,
                         "run_number": mile_number,
                         "mile_time": formatted_time
-                    }).execute()
+                    },
+                    on_conflict="user_email, student_name, run_number"
+                    ).execute()
 
                     # 2. Update local state so UI updates immediately
                     if student_target not in st.session_state.students:
